@@ -5,14 +5,15 @@ from engine import OptimizationEngine
 st.set_page_config(layout="wide")
 st.title("🧠 Universal Optimization Builder")
 
-# Sidebar Solver Selection
 st.sidebar.title("Solver Settings")
 solver_choice = st.sidebar.selectbox(
     "Choose Solver Backend",
     ["PuLP", "OR-Tools", "Compare Both"]
 )
 
-# Upload dataset
+time_limit = st.sidebar.number_input("Time Limit (seconds, 0 = no limit)", min_value=0.0)
+relative_gap = st.sidebar.number_input("Relative Gap (e.g. 0.02 for 2%)", min_value=0.0)
+
 st.header("1️⃣ Upload Dataset")
 file = st.file_uploader("Upload CSV")
 
@@ -70,7 +71,6 @@ if file:
         st.write(lg)
 
     st.header("Budget Constraint (Optional)")
-
     budget_col = st.selectbox("Amount Column for Budget", numeric_cols)
     budget_value = st.number_input("Enter Budget (0 = ignore)", min_value=0.0)
 
@@ -78,9 +78,14 @@ if file:
 
     if st.button("Run Optimization"):
 
-        if solver_choice != "Compare Both":
+        def run_solver(backend, tl=None, gap=None):
 
-            engine = OptimizationEngine(df, solver_backend=solver_choice)
+            engine = OptimizationEngine(
+                df,
+                solver_backend=backend,
+                time_limit=tl if tl > 0 else None,
+                relative_gap=gap if gap > 0 else None
+            )
 
             engine.add_row_variable(var_type)
             engine.set_objective(direction, objective_col)
@@ -94,46 +99,59 @@ if file:
             for lg in st.session_state.linking_groups:
                 engine.add_linking_group(*lg)
 
-            result = engine.solve()
+            return engine.solve()
+
+        if solver_choice != "Compare Both":
+
+            result = run_solver(
+                solver_choice,
+                time_limit,
+                relative_gap
+            )
 
             st.write("Status:", result["status"])
             st.write("Objective Value:", result["objective"])
-            st.write("Solve Time (seconds):", round(result["solve_time"], 6))
+            st.write("Solve Time:", round(result["solve_time"], 6))
+            st.write("Gap:", result["gap"])
 
             df["Decision"] = df.index.map(result["solution"])
-            selected_df = df[df["Decision"] > 0]
-
             st.subheader("Selected Records")
-            st.dataframe(selected_df)
+            st.dataframe(df[df["Decision"] > 0])
 
         else:
 
-            results = []
+            full = run_solver(solver_choice="PuLP" if solver_choice == "Compare Both" else solver_choice)
 
-            for backend in ["PuLP", "OR-Tools"]:
+            early = run_solver(
+                backend="PuLP",
+                tl=time_limit,
+                gap=relative_gap
+            )
 
-                engine = OptimizationEngine(df, solver_backend=backend)
+            comparison = pd.DataFrame([
+                {
+                    "Mode": "Full Optimal",
+                    "Objective": full["objective"],
+                    "Time": round(full["solve_time"], 6),
+                    "Gap": full["gap"],
+                    "Status": full["status"]
+                },
+                {
+                    "Mode": "Early Stop",
+                    "Objective": early["objective"],
+                    "Time": round(early["solve_time"], 6),
+                    "Gap": early["gap"],
+                    "Status": early["status"]
+                }
+            ])
 
-                engine.add_row_variable(var_type)
-                engine.set_objective(direction, objective_col)
+            st.subheader("Comparison")
+            st.dataframe(comparison)
 
-                if budget_value > 0:
-                    engine.add_budget_constraint(budget_col, budget_value)
+            st.subheader("Full Solution Records")
+            df["Decision"] = df.index.map(full["solution"])
+            st.dataframe(df[df["Decision"] > 0])
 
-                for gc in st.session_state.group_constraints:
-                    engine.add_group_constraint(*gc)
-
-                for lg in st.session_state.linking_groups:
-                    engine.add_linking_group(*lg)
-
-                result = engine.solve()
-
-                results.append({
-                    "Solver": backend,
-                    "Status": result["status"],
-                    "Objective": result["objective"],
-                    "Solve Time (sec)": round(result["solve_time"], 6)
-                })
-
-            st.subheader("Solver Comparison")
-            st.dataframe(pd.DataFrame(results))
+            st.subheader("Early Stop Solution Records")
+            df["Decision"] = df.index.map(early["solution"])
+            st.dataframe(df[df["Decision"] > 0])

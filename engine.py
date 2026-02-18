@@ -5,18 +5,22 @@ from ortools.linear_solver import pywraplp
 
 class OptimizationEngine:
 
-    def __init__(self, df, solver_backend="PuLP"):
+    def __init__(self, df, solver_backend="PuLP",
+                 time_limit=None, relative_gap=None):
+
         self.df = df
         self.backend = solver_backend
 
-        # Shared definitions
+        # stopping criteria
+        self.time_limit = time_limit
+        self.relative_gap = relative_gap
+
+        # shared modeling
         self.var_type = None
         self.direction = None
         self.objective_col = None
-
         self.group_constraints = []
         self.linking_constraints = []
-
         self.budget_col = None
         self.budget_value = None
 
@@ -81,7 +85,6 @@ class OptimizationEngine:
         self.budget_value = budget
 
         if self.backend == "PuLP":
-
             self.model += pulp.lpSum(
                 self.x_vars[i] * self.df.loc[i, amount_col]
                 for i in self.df.index
@@ -94,7 +97,7 @@ class OptimizationEngine:
         self.linking_constraints.append((group_col, upper_col, lower_col))
 
     # ----------------------------
-    # Solve router
+    # Solve Router
     # ----------------------------
     def solve(self):
 
@@ -104,15 +107,13 @@ class OptimizationEngine:
             return self._solve_ortools()
 
     # ==================================================
-    # PuLP Solver (UNCHANGED LOGIC)
+    # PuLP Solver (Full parity + time/gap)
     # ==================================================
     def _solve_pulp(self):
 
         # Apply group constraints
         for group_col, sense, rhs_col in self.group_constraints:
-
             for g in self.df[group_col].unique():
-
                 idx = self.df[self.df[group_col] == g].index
                 lhs = pulp.lpSum(self.x_vars[i] for i in idx)
                 rhs = self.df.loc[idx[0], rhs_col]
@@ -124,18 +125,16 @@ class OptimizationEngine:
                 else:
                     self.model += lhs == rhs
 
-        # Apply linking constraints
+        # Linking constraints
         for group_col, upper_col, lower_col in self.linking_constraints:
 
             y_group = {}
-
             for g in self.df[group_col].unique():
                 y_group[g] = pulp.LpVariable(
                     f"y_{group_col}_{g}", cat="Binary"
                 )
 
             for g in self.df[group_col].unique():
-
                 idx = self.df[self.df[group_col] == g].index
                 total = pulp.lpSum(self.x_vars[i] for i in idx)
 
@@ -147,8 +146,14 @@ class OptimizationEngine:
                     lower = self.df.loc[idx[0], lower_col]
                     self.model += total >= lower * y_group[g]
 
+        solver = pulp.PULP_CBC_CMD(
+            timeLimit=self.time_limit,
+            gapRel=self.relative_gap,
+            msg=False
+        )
+
         start = time.time()
-        self.model.solve()
+        self.model.solve(solver)
         end = time.time()
 
         return {
@@ -157,18 +162,24 @@ class OptimizationEngine:
             "solution": {
                 i: pulp.value(self.x_vars[i]) for i in self.df.index
             },
-            "solve_time": end - start
+            "solve_time": end - start,
+            "gap": None  # CBC does not expose reliably
         }
 
     # ==================================================
-    # OR-Tools Solver (FULL PARITY)
+    # OR-Tools Solver (Full parity + time/gap)
     # ==================================================
     def _solve_ortools(self):
 
         solver = pywraplp.Solver.CreateSolver("SCIP")
-
         if not solver:
-            return {"status": "OR-Tools solver unavailable"}
+            return {"status": "Solver unavailable"}
+
+        if self.time_limit:
+            solver.SetTimeLimit(int(self.time_limit * 1000))
+
+        if self.relative_gap:
+            solver.SetRelativeMipGap(self.relative_gap)
 
         # Create decision variables
         x = {}
@@ -183,7 +194,6 @@ class OptimizationEngine:
 
         # Objective
         objective = solver.Objective()
-
         for i in self.df.index:
             objective.SetCoefficient(x[i], self.df.loc[i, self.objective_col])
 
@@ -194,9 +204,7 @@ class OptimizationEngine:
 
         # Group constraints
         for group_col, sense, rhs_col in self.group_constraints:
-
             for g in self.df[group_col].unique():
-
                 idx = self.df[self.df[group_col] == g].index
                 rhs = self.df.loc[idx[0], rhs_col]
 
@@ -212,22 +220,18 @@ class OptimizationEngine:
 
         # Budget constraint
         if self.budget_value and self.budget_value > 0:
-
             ct = solver.RowConstraint(0, self.budget_value, "")
-
             for i in self.df.index:
                 ct.SetCoefficient(x[i], self.df.loc[i, self.budget_col])
 
-        # Linking constraints (capacity × y, MOQ × y)
+        # Linking constraints
         for group_col, upper_col, lower_col in self.linking_constraints:
 
             y = {}
-
             for g in self.df[group_col].unique():
                 y[g] = solver.IntVar(0, 1, f"y_{group_col}_{g}")
 
             for g in self.df[group_col].unique():
-
                 idx = self.df[self.df[group_col] == g].index
 
                 if upper_col:
@@ -254,5 +258,6 @@ class OptimizationEngine:
             "solution": {
                 i: x[i].solution_value() for i in self.df.index
             },
-            "solve_time": end - start
+            "solve_time": end - start,
+            "gap": solver.MipGap() if solver.IsMip() else None
         }
